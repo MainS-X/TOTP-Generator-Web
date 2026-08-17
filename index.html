@@ -18,6 +18,8 @@
     .typo-display-4,.typo-display-4-opacity{font-weight:300;font-size:112px;letter-spacing:-.04em}.typo-display-4-opacity{opacity:.54}
     .text-center{text-align:center!important}
     .center{display:block!important;margin-right:auto!important;margin-left:auto!important}
+    .time-status{margin:4px 0 12px;font-size:13px;line-height:20px;opacity:.72}
+    .time-status.warning{color:#b3261e;opacity:1}
 
   </style>
   <!-- MDUI CSS -->
@@ -55,14 +57,146 @@
       <div class="card-primary-subtitle">点击此卡片可复制TOTP</div>
     <p id="totp" class="typo-display-4 text-center"></p>
     <p id="remaining-time"></p>
+    <p id="time-status" class="time-status" aria-live="polite">正在校准网络时间…</p>
     <mdui-linear-progress id="progress" value="0" max="100"></mdui-linear-progress>
   </div>
   </mdui-card>
 
   <script>
     var timerId;
+    var timeSyncTimerId;
     var timeStep = 30;
     var updateInterval = 250;
+    var timeSyncInterval = 5 * 60 * 1000;
+    var timeSyncRetryInterval = 30 * 1000;
+    var trustedClock = null;
+    var timeSyncPromise = null;
+
+    function monotonicNow() {
+      if (window.performance && typeof window.performance.now === 'function') {
+        return window.performance.now();
+      }
+      return Date.now();
+    }
+
+    // 使用服务端 Date 响应头建立可信时间锚点，密钥和验证码不会被发送出去。
+    function currentTimestampMs() {
+      if (!trustedClock) {
+        return Date.now();
+      }
+
+      return trustedClock.epochMs + (monotonicNow() - trustedClock.monotonicMs);
+    }
+
+    function setTimeStatus(message, isWarning) {
+      var status = document.getElementById('time-status');
+      status.textContent = message;
+      status.classList.toggle('warning', Boolean(isWarning));
+    }
+
+    function buildTimeSyncUrl() {
+      var url = new URL(window.location.href);
+      url.hash = '';
+      url.searchParams.set('_totp_time_sync', Date.now().toString(36) + Math.random().toString(36).slice(2));
+      return url.toString();
+    }
+
+    async function fetchNetworkTimeSample() {
+      var startedAt = monotonicNow();
+      var response = await fetch(buildTimeSyncUrl(), {
+        method: 'HEAD',
+        cache: 'no-store',
+        credentials: 'same-origin'
+      });
+      var receivedAt = monotonicNow();
+
+      if (!response.ok) {
+        throw new Error('time sync request failed');
+      }
+
+      var dateHeader = response.headers.get('Date');
+      var serverTimestamp = Date.parse(dateHeader || '');
+      if (!Number.isFinite(serverTimestamp)) {
+        throw new Error('missing server time');
+      }
+
+      var roundTripTime = Math.max(0, receivedAt - startedAt);
+      return {
+        // HTTP Date 精确到秒，增加 500ms 取该秒的中点，再补偿约半个往返延迟。
+        epochMs: serverTimestamp + 500 + roundTripTime / 2,
+        monotonicMs: receivedAt,
+        roundTripTime: roundTripTime
+      };
+    }
+
+    function scheduleTimeSync(delay) {
+      clearTimeout(timeSyncTimerId);
+      timeSyncTimerId = setTimeout(function () {
+        synchronizeTime(true);
+      }, delay || timeSyncInterval);
+    }
+
+    async function synchronizeTime(force) {
+      var trustedClockAge = trustedClock ? monotonicNow() - trustedClock.monotonicMs : Infinity;
+      var currentDeviceOffset = trustedClock ? currentTimestampMs() - Date.now() : Infinity;
+      var deviceClockChanged = trustedClock
+        ? Math.abs(currentDeviceOffset - trustedClock.deviceOffsetMs) >= 2000
+        : true;
+      if (!force && trustedClockAge < timeSyncInterval && !deviceClockChanged) {
+        return true;
+      }
+      if (timeSyncPromise) {
+        return timeSyncPromise;
+      }
+
+      setTimeStatus('正在校准网络时间…', false);
+      timeSyncPromise = (async function () {
+        try {
+          var samples = [];
+          for (var i = 0; i < 3; i++) {
+            try {
+              samples.push(await fetchNetworkTimeSample());
+            } catch (error) {
+              // 单次请求失败时继续尝试，避免临时网络波动导致校准失败。
+            }
+          }
+
+          if (!samples.length) {
+            throw new Error('time sync failed');
+          }
+
+          samples.sort(function (a, b) {
+            return a.roundTripTime - b.roundTripTime;
+          });
+          trustedClock = samples[0];
+          trustedClock.deviceOffsetMs = currentTimestampMs() - Date.now();
+
+          var offsetSeconds = Math.round(trustedClock.deviceOffsetMs / 1000);
+          if (Math.abs(offsetSeconds) >= 2) {
+            setTimeStatus('网络时间已校准，已自动修正设备时间偏差', false);
+          } else {
+            setTimeStatus('网络时间已校准', false);
+          }
+
+          updateTOTP();
+          scheduleNextUpdate();
+          scheduleTimeSync(timeSyncInterval);
+          return true;
+        } catch (error) {
+          if (trustedClock) {
+            setTimeStatus('暂时无法重新校准，继续使用上次的网络时间', true);
+          } else {
+            setTimeStatus('网络时间校准失败，当前使用设备时间，请检查系统时间', true);
+          }
+          scheduleTimeSync(timeSyncRetryInterval);
+          return Boolean(trustedClock);
+        } finally {
+          timeSyncPromise = null;
+        }
+      })();
+
+      return timeSyncPromise;
+    }
 
     // 始终根据传入时间重新计算，不依赖页面上缓存的验证码。
     function calculateTOTP(rawKey, timestampMs) {
@@ -120,7 +254,7 @@
 
     function updateTOTP() {
       var key = document.getElementById('key').value || '';
-      return renderTOTP(calculateTOTP(key, Date.now()));
+      return renderTOTP(calculateTOTP(key, currentTimestampMs()));
     }
 
     function scheduleNextUpdate() {
@@ -131,7 +265,7 @@
         return;
       }
 
-      var delay = updateInterval - (Date.now() % updateInterval) + 10;
+      var delay = updateInterval - (currentTimestampMs() % updateInterval) + 10;
       timerId = setTimeout(function () {
         updateTOTP();
         scheduleNextUpdate();
@@ -141,6 +275,7 @@
     function generateTOTP() {
       var otp = updateTOTP();
       scheduleNextUpdate();
+      synchronizeTime(false);
       return otp;
     }
 
@@ -183,7 +318,8 @@
     }
 
     async function copyKey() {
-      // 复制前强制使用当前时间重新计算，绝不复制可能过期的 DOM 文本。
+      // 复制前确保使用可信时间重新计算，绝不复制可能过期的 DOM 文本。
+      await synchronizeTime(false);
       var otp = updateTOTP();
       scheduleNextUpdate();
 
@@ -207,10 +343,20 @@
         clearTimeout(timerId);
       } else {
         resyncTOTP();
+        synchronizeTime(false);
       }
     });
-    window.addEventListener('focus', resyncTOTP);
-    window.addEventListener('pageshow', resyncTOTP);
+    window.addEventListener('focus', function () {
+      resyncTOTP();
+      synchronizeTime(false);
+    });
+    window.addEventListener('pageshow', function () {
+      resyncTOTP();
+      synchronizeTime(false);
+    });
+    window.addEventListener('online', function () {
+      synchronizeTime(true);
+    });
 
     // Base32解码
     function base32Decode(input) {
@@ -290,6 +436,7 @@
     }
 
     resyncTOTP();
+    synchronizeTime(true);
   </script>
 
 </body>
