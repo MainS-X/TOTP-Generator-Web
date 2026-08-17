@@ -30,7 +30,7 @@
   <!-- MDUI JavaScript -->
   <script src="https://unpkg.com/mdui@2.0.3/mdui.global.js"></script>
 </head>
-<body class="container"></body>
+<body class="container">
   <mdui-top-app-bar>
     <mdui-top-app-bar-title>TOTP 生成器</mdui-top-app-bar-title>
     <div style="flex-grow: 1"></div>
@@ -59,72 +59,158 @@
   </div>
   </mdui-card>
 
-<!-- 复制 -->
-<script>
-function copyKey() {
-  var totpElement = document.getElementById('totp');
-  if (totpElement) {
-    var range = document.createRange();
-    range.selectNode(totpElement);
-    window.getSelection().removeAllRanges();
-    window.getSelection().addRange(range);
-    document.execCommand('copy');
-    window.getSelection().removeAllRanges();
-    mdui.snackbar({message: '已复制', position: 'top',});
-  }
-}
-
-</script>
-  
   <script>
     var timerId;
+    var timeStep = 30;
+    var updateInterval = 250;
+
+    // 始终根据传入时间重新计算，不依赖页面上缓存的验证码。
+    function calculateTOTP(rawKey, timestampMs) {
+      var normalizedKey = rawKey.toUpperCase().replace(/\s/g, '');
+      if (!normalizedKey) {
+        return { error: '' };
+      }
+
+      if (!/^[A-Z2-7]+={0,6}$/.test(normalizedKey)) {
+        return { error: '密钥格式无效，请输入 Base32 密钥' };
+      }
+
+      try {
+        var key = base32Decode(normalizedKey);
+        var currTime = Math.floor(timestampMs / 1000);
+        var message = Math.floor(currTime / timeStep).toString(16).padStart(16, '0');
+        var hmacHash = hmacSHA1(key, hexToBytes(message));
+        var offset = hmacHash[19] & 0xf;
+        var otp =
+          ((hmacHash[offset] & 0x7f) << 24) |
+          (hmacHash[offset + 1] << 16) |
+          (hmacHash[offset + 2] << 8) |
+          hmacHash[offset + 3];
+
+        var elapsedSeconds = (timestampMs / 1000) % timeStep;
+        return {
+          otp: (otp % 1000000).toString().padStart(6, '0'),
+          remainingTime: Math.ceil(timeStep - elapsedSeconds),
+          progress: ((timeStep - elapsedSeconds) / timeStep) * 100
+        };
+      } catch (error) {
+        return { error: '无法生成验证码，请检查密钥' };
+      }
+    }
+
+    function renderTOTP(result) {
+      var totpElement = document.getElementById('totp');
+      var remainingTimeElement = document.getElementById('remaining-time');
+      var progress = document.getElementById('progress');
+
+      if (!result.otp) {
+        totpElement.textContent = '';
+        remainingTimeElement.textContent = result.error || '';
+        progress.value = 0;
+        progress.style.display = 'none';
+        return null;
+      }
+
+      totpElement.textContent = result.otp;
+      remainingTimeElement.textContent = '剩余时间: ' + result.remainingTime + ' 秒';
+      progress.style.display = 'block';
+      progress.value = result.progress;
+      return result.otp;
+    }
+
+    function updateTOTP() {
+      var key = document.getElementById('key').value || '';
+      return renderTOTP(calculateTOTP(key, Date.now()));
+    }
+
+    function scheduleNextUpdate() {
+      clearTimeout(timerId);
+
+      // 隐藏页面不依赖后台计时器；恢复可见时会由事件立即重新同步。
+      if (document.hidden) {
+        return;
+      }
+
+      var delay = updateInterval - (Date.now() % updateInterval) + 10;
+      timerId = setTimeout(function () {
+        updateTOTP();
+        scheduleNextUpdate();
+      }, delay);
+    }
 
     function generateTOTP() {
-      clearTimeout(timerId); // 清除之前的定时器
-
-      var key = document.getElementById('key').value;
-
-      // 将所有小写字母转换为大写字母并去掉空格
-      key = key.toUpperCase().replace(/\s/g, "");
-      // 将Base32编码的密钥解码为二进制
-      key = base32Decode(key);
-
-      // 定义哈希算法
-      var digestAlgorithm = 'SHA-1';
-
-      // 获取当前时间戳
-      var timeStep = 30;  // 默认时间步长为30秒
-      var currTime = Math.floor(Date.now() / 1000);
-
-      // 计算到下一个30秒的剩余时间并减去1秒以确保刚好取到当前的30秒
-      var remainingTime = timeStep - (currTime % timeStep) - 1;
-      var remainingTimems = timeStep - (Date.now() / 1000 % timeStep) - 1;
-
-      // 计算基于时间的单次密码
-      var message = Math.floor(currTime / timeStep).toString(16);
-      message = message.padStart(16, '0');
-      var hmacHash = hmacSHA1(key, hexToBytes(message));
-      var offset = hmacHash[19] & 0xf;
-      var otp =
-        ((hmacHash[offset] & 0x7f) << 24) |
-        (hmacHash[offset + 1] << 16) |
-        (hmacHash[offset + 2] << 8) |
-        hmacHash[offset + 3];
-      otp = (otp % 1000000).toString().padStart(6, '0');
-
-      // 更新TOTP密码和剩余时间的显示
-      document.getElementById('totp').textContent = otp;
-      document.getElementById('remaining-time').textContent = '剩余时间: ' + remainingTime + ' 秒';
-
-      // 更新进度条
-      var progress = document.getElementById('progress');
-      var progressWidth = (remainingTimems / timeStep) * 100;
-      progress.style.display = 'block';
-      progress.value = progressWidth;
-
-      // 每0.1秒更新一次
-      timerId = setTimeout(generateTOTP, 100);
+      var otp = updateTOTP();
+      scheduleNextUpdate();
+      return otp;
     }
+
+    function resyncTOTP() {
+      generateTOTP();
+    }
+
+    function showSnackbar(message) {
+      if (window.mdui && typeof window.mdui.snackbar === 'function') {
+        window.mdui.snackbar({ message: message, position: 'top' });
+      }
+    }
+
+    function legacyCopyText(text) {
+      var textArea = document.createElement('textarea');
+      textArea.value = text;
+      textArea.setAttribute('readonly', '');
+      textArea.style.position = 'fixed';
+      textArea.style.opacity = '0';
+      document.body.appendChild(textArea);
+      try {
+        textArea.select();
+        return document.execCommand('copy');
+      } finally {
+        document.body.removeChild(textArea);
+      }
+    }
+
+    async function copyText(text) {
+      if (navigator.clipboard && window.isSecureContext) {
+        try {
+          await navigator.clipboard.writeText(text);
+          return true;
+        } catch (error) {
+          // 某些浏览器虽然暴露 Clipboard API，但会因权限策略拒绝写入。
+        }
+      }
+
+      return legacyCopyText(text);
+    }
+
+    async function copyKey() {
+      // 复制前强制使用当前时间重新计算，绝不复制可能过期的 DOM 文本。
+      var otp = updateTOTP();
+      scheduleNextUpdate();
+
+      if (!otp) {
+        showSnackbar('请先输入有效密钥');
+        return;
+      }
+
+      try {
+        if (!await copyText(otp)) {
+          throw new Error('copy failed');
+        }
+        showSnackbar('已复制');
+      } catch (error) {
+        showSnackbar('复制失败，请手动复制');
+      }
+    }
+
+    document.addEventListener('visibilitychange', function () {
+      if (document.hidden) {
+        clearTimeout(timerId);
+      } else {
+        resyncTOTP();
+      }
+    });
+    window.addEventListener('focus', resyncTOTP);
+    window.addEventListener('pageshow', resyncTOTP);
 
     // Base32解码
     function base32Decode(input) {
@@ -135,11 +221,18 @@ function copyKey() {
       }
       
       input = input.replace(/=+$/, '');
+      if (!input) {
+        throw new Error('empty Base32 key');
+      }
+
       var bits = '';
       var output = [];
       for (var i = 0; i < input.length; i++) {
         var char = input.charAt(i).toUpperCase();
         var val = base32lookup[char];
+        if (val === undefined) {
+          throw new Error('invalid Base32 character');
+        }
         bits += ('00000' + val.toString(2)).slice(-5);
       }
       while (bits.length >= 8) {
@@ -195,6 +288,8 @@ function copyKey() {
       result.set(b, a.length);
       return result;
     }
+
+    resyncTOTP();
   </script>
 
 </body>
