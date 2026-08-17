@@ -18,8 +18,7 @@
     .typo-display-4,.typo-display-4-opacity{font-weight:300;font-size:112px;letter-spacing:-.04em}.typo-display-4-opacity{opacity:.54}
     .text-center{text-align:center!important}
     .center{display:block!important;margin-right:auto!important;margin-left:auto!important}
-    .time-status{margin:4px 0 12px;font-size:13px;line-height:20px;opacity:.72}
-    .time-status.warning{color:#b3261e;opacity:1}
+    #key{display:block;min-height:72px}
 
   </style>
   <!-- MDUI CSS -->
@@ -57,7 +56,6 @@
       <div class="card-primary-subtitle">点击此卡片可复制TOTP</div>
     <p id="totp" class="typo-display-4 text-center"></p>
     <p id="remaining-time"></p>
-    <p id="time-status" class="time-status" aria-live="polite">正在校准网络时间…</p>
     <mdui-linear-progress id="progress" value="0" max="100"></mdui-linear-progress>
   </div>
   </mdui-card>
@@ -86,12 +84,6 @@
       }
 
       return trustedClock.epochMs + (monotonicNow() - trustedClock.monotonicMs);
-    }
-
-    function setTimeStatus(message, isWarning) {
-      var status = document.getElementById('time-status');
-      status.textContent = message;
-      status.classList.toggle('warning', Boolean(isWarning));
     }
 
     function buildTimeSyncUrl() {
@@ -149,7 +141,6 @@
         return timeSyncPromise;
       }
 
-      setTimeStatus('正在校准网络时间…', false);
       timeSyncPromise = (async function () {
         try {
           var samples = [];
@@ -171,23 +162,11 @@
           trustedClock = samples[0];
           trustedClock.deviceOffsetMs = currentTimestampMs() - Date.now();
 
-          var offsetSeconds = Math.round(trustedClock.deviceOffsetMs / 1000);
-          if (Math.abs(offsetSeconds) >= 2) {
-            setTimeStatus('网络时间已校准，已自动修正设备时间偏差', false);
-          } else {
-            setTimeStatus('网络时间已校准', false);
-          }
-
           updateTOTP();
           scheduleNextUpdate();
           scheduleTimeSync(timeSyncInterval);
           return true;
         } catch (error) {
-          if (trustedClock) {
-            setTimeStatus('暂时无法重新校准，继续使用上次的网络时间', true);
-          } else {
-            setTimeStatus('网络时间校准失败，当前使用设备时间，请检查系统时间', true);
-          }
           scheduleTimeSync(timeSyncRetryInterval);
           return Boolean(trustedClock);
         } finally {
