@@ -18,6 +18,7 @@
     .typo-display-4,.typo-display-4-opacity{font-weight:300;font-size:112px;letter-spacing:-.04em}.typo-display-4-opacity{opacity:.54}
     .text-center{text-align:center!important}
     .center{display:block!important;margin-right:auto!important;margin-left:auto!important}
+    .key-instruction{margin:24px 0;font-size:clamp(24px,3vw,32px);font-weight:500;line-height:1.5}
     #key{display:block;min-height:72px}
 
   </style>
@@ -46,6 +47,7 @@
      </mdui-tooltip>
   </mdui-top-app-bar>
 
+  <p class="key-instruction text-center">粘贴二次验证密钥（totp key）生成验证码</p>
   <mdui-text-field label="输入密钥" icon="vpn_key" id="key" oninput="generateTOTP()" autofocus></mdui-text-field>
 
 <p></p>
