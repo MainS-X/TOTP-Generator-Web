@@ -65,10 +65,15 @@
     var timeSyncTimerId;
     var timeStep = 30;
     var updateInterval = 250;
-    var timeSyncInterval = 5 * 60 * 1000;
-    var timeSyncRetryInterval = 30 * 1000;
+    var timeSyncInterval = 30 * 60 * 1000;
+    var timeSyncRetryInterval = 60 * 1000;
+    var timeSyncRequestTimeout = 5 * 1000;
     var trustedClock = null;
     var timeSyncPromise = null;
+    var timeSyncAbortController = null;
+    var nextTimeSyncAt = 0;
+    var timeSyncFailureCount = 0;
+    var pageSuspended = false;
 
     function monotonicNow() {
       if (window.performance && typeof window.performance.now === 'function') {
@@ -95,11 +100,25 @@
 
     async function fetchNetworkTimeSample() {
       var startedAt = monotonicNow();
-      var response = await fetch(buildTimeSyncUrl(), {
-        method: 'HEAD',
-        cache: 'no-store',
-        credentials: 'same-origin'
-      });
+      var controller = new AbortController();
+      timeSyncAbortController = controller;
+      var timeoutId = setTimeout(function () {
+        controller.abort();
+      }, timeSyncRequestTimeout);
+      var response;
+      try {
+        response = await fetch(buildTimeSyncUrl(), {
+          method: 'HEAD',
+          cache: 'no-store',
+          credentials: 'same-origin',
+          signal: controller.signal
+        });
+      } finally {
+        clearTimeout(timeoutId);
+        if (timeSyncAbortController === controller) {
+          timeSyncAbortController = null;
+        }
+      }
       var receivedAt = monotonicNow();
 
       if (!response.ok) {
@@ -121,33 +140,66 @@
       };
     }
 
-    function scheduleTimeSync(delay) {
-      clearTimeout(timeSyncTimerId);
-      timeSyncTimerId = setTimeout(function () {
-        synchronizeTime(true);
-      }, delay || timeSyncInterval);
+    function canSynchronizeTime() {
+      var key = (document.getElementById('key').value || '').toUpperCase().replace(/\s/g, '');
+      return !pageSuspended && !document.hidden && navigator.onLine !== false &&
+        /^https?:$/.test(window.location.protocol) && /^[A-Z2-7]+={0,6}$/.test(key);
     }
 
-    async function synchronizeTime(force) {
-      var trustedClockAge = trustedClock ? monotonicNow() - trustedClock.monotonicMs : Infinity;
-      var currentDeviceOffset = trustedClock ? currentTimestampMs() - Date.now() : Infinity;
-      var deviceClockChanged = trustedClock
-        ? Math.abs(currentDeviceOffset - trustedClock.deviceOffsetMs) >= 2000
-        : true;
-      if (!force && trustedClockAge < timeSyncInterval && !deviceClockChanged) {
-        return true;
+    function pauseTimeSync() {
+      clearTimeout(timeSyncTimerId);
+      if (timeSyncAbortController) {
+        timeSyncAbortController.abort();
+      }
+    }
+
+    function scheduleTimeSync() {
+      clearTimeout(timeSyncTimerId);
+      if (!canSynchronizeTime()) {
+        return;
+      }
+      timeSyncTimerId = setTimeout(function () {
+        synchronizeTime();
+      }, Math.max(0, nextTimeSyncAt - monotonicNow()));
+    }
+
+    async function synchronizeTime() {
+      if (!canSynchronizeTime()) {
+        pauseTimeSync();
+        return Boolean(trustedClock);
       }
       if (timeSyncPromise) {
         return timeSyncPromise;
       }
 
+      var now = monotonicNow();
+      var deviceClockChanged = trustedClock &&
+        Math.abs(currentTimestampMs() - Date.now() - trustedClock.deviceOffsetMs) >= 2000;
+      if (deviceClockChanged && !timeSyncFailureCount) {
+        // 休眠后部分浏览器的单调时钟会暂停，此时需要立即重新校准。
+        nextTimeSyncAt = now;
+      }
+      // 所有入口共用截止时间，输入、焦点和联网事件都不能绕过失败退避。
+      if (now < nextTimeSyncAt) {
+        scheduleTimeSync();
+        return Boolean(trustedClock);
+      }
+      clearTimeout(timeSyncTimerId);
+      nextTimeSyncAt = now + timeSyncRetryInterval;
+
       timeSyncPromise = (async function () {
         try {
           var samples = [];
           for (var i = 0; i < 3; i++) {
+            if (!canSynchronizeTime()) {
+              break;
+            }
             try {
               samples.push(await fetchNetworkTimeSample());
             } catch (error) {
+              if (error.name === 'AbortError') {
+                throw error;
+              }
               // 单次请求失败时继续尝试，避免临时网络波动导致校准失败。
             }
           }
@@ -161,16 +213,23 @@
           });
           trustedClock = samples[0];
           trustedClock.deviceOffsetMs = currentTimestampMs() - Date.now();
+          timeSyncFailureCount = 0;
+          nextTimeSyncAt = monotonicNow() + timeSyncInterval;
 
           updateTOTP();
           scheduleNextUpdate();
-          scheduleTimeSync(timeSyncInterval);
           return true;
         } catch (error) {
-          scheduleTimeSync(timeSyncRetryInterval);
+          if (canSynchronizeTime()) {
+            timeSyncFailureCount++;
+            var retryDelay = Math.min(timeSyncInterval,
+              timeSyncRetryInterval * Math.pow(2, timeSyncFailureCount - 1));
+            nextTimeSyncAt = monotonicNow() + retryDelay;
+          }
           return Boolean(trustedClock);
         } finally {
           timeSyncPromise = null;
+          scheduleTimeSync();
         }
       })();
 
@@ -240,7 +299,7 @@
       clearTimeout(timerId);
 
       // 隐藏页面不依赖后台计时器；恢复可见时会由事件立即重新同步。
-      if (document.hidden) {
+      if (document.hidden || pageSuspended) {
         return;
       }
 
@@ -254,7 +313,7 @@
     function generateTOTP() {
       var otp = updateTOTP();
       scheduleNextUpdate();
-      synchronizeTime(false);
+      synchronizeTime();
       return otp;
     }
 
@@ -298,7 +357,7 @@
 
     async function copyKey() {
       // 复制前确保使用可信时间重新计算，绝不复制可能过期的 DOM 文本。
-      await synchronizeTime(false);
+      await synchronizeTime();
       var otp = updateTOTP();
       scheduleNextUpdate();
 
@@ -320,21 +379,22 @@
     document.addEventListener('visibilitychange', function () {
       if (document.hidden) {
         clearTimeout(timerId);
+        pauseTimeSync();
       } else {
         resyncTOTP();
-        synchronizeTime(false);
       }
     });
-    window.addEventListener('focus', function () {
-      resyncTOTP();
-      synchronizeTime(false);
-    });
+    window.addEventListener('focus', resyncTOTP);
     window.addEventListener('pageshow', function () {
+      pageSuspended = false;
       resyncTOTP();
-      synchronizeTime(false);
     });
-    window.addEventListener('online', function () {
-      synchronizeTime(true);
+    window.addEventListener('online', resyncTOTP);
+    window.addEventListener('offline', pauseTimeSync);
+    window.addEventListener('pagehide', function () {
+      pageSuspended = true;
+      clearTimeout(timerId);
+      pauseTimeSync();
     });
 
     // Base32解码
@@ -415,7 +475,6 @@
     }
 
     resyncTOTP();
-    synchronizeTime(true);
   </script>
 
 </body>
